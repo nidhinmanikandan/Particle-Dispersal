@@ -3,27 +3,92 @@ import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 
 const DEFAULT_IMAGE = `data:image/svg+xml,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" width="360" height="360" viewBox="0 0 360 360"><rect width="360" height="360" fill="#050606"/><defs><radialGradient id="g"><stop stop-color="#ffffff"/><stop offset=".56" stop-color="#d8e2e3"/><stop offset="1" stop-color="#263334"/></radialGradient></defs><circle cx="180" cy="180" r="112" fill="url(#g)"/><circle cx="144" cy="148" r="10" fill="#101414"/><circle cx="216" cy="148" r="10" fill="#101414"/><path d="M135 205 Q180 255 225 205" fill="none" stroke="#101414" stroke-width="8" stroke-linecap="round"/></svg>`)}`;
+const TRACK_MARKER_COUNT = 12;
+const MIN_PARTICLE_COUNT = 25000;
+const MAX_PARTICLE_COUNT = 150000;
+const MAX_SAMPLE_DIMENSION = 1024;
+const IMAGE_FIT_FRACTION = 0.75;
+const MAX_VISUAL_SCALE = 2;
 
 function makeParticles(image, density, depth) {
+  const detailCanvas = document.createElement("canvas");
+  detailCanvas.width = 64;
+  detailCanvas.height = 64;
+  const detailContext = detailCanvas.getContext("2d", {
+    willReadFrequently: true,
+  });
+  detailContext.drawImage(image, 0, 0, 64, 64);
+  const detailPixels = detailContext.getImageData(0, 0, 64, 64).data;
+  let edgePixels = 0;
+  let opaquePixels = 0;
+  for (let y = 0; y < 64; y++) {
+    for (let x = 0; x < 64; x++) {
+      const i = (y * 64 + x) * 4;
+      if (detailPixels[i + 3] < 20) continue;
+      opaquePixels++;
+      const luminance =
+        (detailPixels[i] * 0.2126 +
+          detailPixels[i + 1] * 0.7152 +
+          detailPixels[i + 2] * 0.0722) /
+        255;
+      let difference = 0;
+      const right = x < 63 ? i + 4 : -1;
+      const below = y < 63 ? i + 256 : -1;
+      for (const neighbor of [right, below]) {
+        if (neighbor < 0) continue;
+        const neighborLuminance =
+          (detailPixels[neighbor] * 0.2126 +
+            detailPixels[neighbor + 1] * 0.7152 +
+            detailPixels[neighbor + 2] * 0.0722) /
+          255;
+        difference = Math.max(
+          difference,
+          Math.abs(luminance - neighborLuminance),
+          Math.abs(detailPixels[i] - detailPixels[neighbor]) / 255,
+          Math.abs(detailPixels[i + 1] - detailPixels[neighbor + 1]) / 255,
+          Math.abs(detailPixels[i + 2] - detailPixels[neighbor + 2]) / 255,
+          Math.abs(detailPixels[i + 3] - detailPixels[neighbor + 3]) / 255,
+        );
+      }
+      if (difference > 0.06) edgePixels++;
+    }
+  }
+  const detailScore =
+    opaquePixels > 0 ? Math.min(1, (edgePixels / opaquePixels) * 4) : 0;
+  const resolutionFactor = THREE.MathUtils.clamp(
+    Math.sqrt((image.naturalWidth * image.naturalHeight) / (512 * 512)),
+    0.5,
+    1.5,
+  );
+  const adaptiveCount = Math.floor(
+    density * resolutionFactor * (0.75 + detailScore * 0.75),
+  );
+  const particleCount = THREE.MathUtils.clamp(
+    adaptiveCount,
+    Math.min(MIN_PARTICLE_COUNT, density),
+    Math.min(MAX_PARTICLE_COUNT, density),
+  );
   const canvas = document.createElement("canvas");
   const aspect = image.naturalWidth / image.naturalHeight;
-  const imageScale = Math.min(
-    1024 / image.naturalWidth,
-    1024 / image.naturalHeight,
+  const sampleDimension = Math.min(
+    MAX_SAMPLE_DIMENSION,
+    Math.max(512, Math.ceil(Math.sqrt(particleCount * 8))),
   );
+  const imageScale =
+    sampleDimension / Math.max(image.naturalWidth, image.naturalHeight);
   canvas.width = Math.max(1, Math.round(image.naturalWidth * imageScale));
   canvas.height = Math.max(1, Math.round(image.naturalHeight * imageScale));
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
   ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
   const pixels = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
-  const columns = Math.max(1, Math.floor(Math.sqrt(density * aspect)));
-  const rows = Math.max(1, Math.ceil(density / columns));
-  const positions = new Float32Array(density * 3);
-  const colors = new Float32Array(density * 4);
+  const columns = Math.max(1, Math.floor(Math.sqrt(particleCount * aspect)));
+  const rows = Math.max(1, Math.ceil(particleCount / columns));
+  const positions = new Float32Array(particleCount * 3);
+  const colors = new Float32Array(particleCount * 4);
   let count = 0;
   const linearize = (value) =>
     value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
-  for (let sample = 0; sample < density; sample++) {
+  for (let sample = 0; sample < particleCount; sample++) {
     const column = sample % columns,
       row = Math.floor(sample / columns);
     const sampleX = Math.min(
@@ -92,15 +157,26 @@ function makeParticles(image, density, depth) {
     movingAmplitudes[i * 3 + 1] = 0.018 + Math.random() * 0.042;
     movingAmplitudes[i * 3 + 2] = 0.025 + Math.random() * 0.055;
   }
-  const trackCount = Math.min(24, movingCount);
+  const trackCandidates = [];
+  for (let i = 0; i < movingCount; i++) {
+    const colorIndex = i * 4;
+    const luminance =
+      movingColors[colorIndex] * 0.2126 +
+      movingColors[colorIndex + 1] * 0.7152 +
+      movingColors[colorIndex + 2] * 0.0722;
+    if (luminance > 0.012) trackCandidates.push(i);
+  }
+  const trackCount = Math.min(TRACK_MARKER_COUNT, trackCandidates.length);
   const trackIndices = new Uint32Array(trackCount);
-  for (let i = 0; i < trackCount; i++) {
-    const selected = i + Math.floor(Math.random() * (movingCount - i));
-    [shuffledIndices[i], shuffledIndices[selected]] = [
-      shuffledIndices[selected],
-      shuffledIndices[i],
+  for (let i = 0; i < trackCandidates.length; i++) {
+    const selected = i + Math.floor(Math.random() * (trackCandidates.length - i));
+    [trackCandidates[i], trackCandidates[selected]] = [
+      trackCandidates[selected],
+      trackCandidates[i],
     ];
-    trackIndices[i] = shuffledIndices[i];
+  }
+  for (let i = 0; i < trackCount; i++) {
+    trackIndices[i] = trackCandidates[i];
   }
   return {
     positions: positions.subarray(0, count * 3),
@@ -113,6 +189,14 @@ function makeParticles(image, density, depth) {
     trackIndices,
     aspect,
   };
+}
+
+function getFitScale(viewHeight, viewportAspect, imageAspect) {
+  return Math.min(
+    viewHeight * IMAGE_FIT_FRACTION,
+    (viewHeight * viewportAspect * IMAGE_FIT_FRACTION) / imageAspect,
+    viewHeight * MAX_VISUAL_SCALE,
+  );
 }
 
 export default function App() {
@@ -164,10 +248,10 @@ export default function App() {
           2 *
           Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) *
           initialCameraDistance;
-        const fitScale = Math.min(
-          baseViewHeight * 0.7,
-          (baseViewHeight * camera.aspect * 0.7) /
-            (image.naturalWidth / image.naturalHeight),
+        const fitScale = getFitScale(
+          baseViewHeight,
+          camera.aspect,
+          image.naturalWidth / image.naturalHeight,
         );
         const data = makeParticles(image, d, z);
         const geometry = new THREE.BufferGeometry();
@@ -291,14 +375,16 @@ export default function App() {
     };
     rebuild(imageSrc);
     let raf;
-    const projectedTracks = Array.from({ length: 24 }, () => ({
+    const projectedTracks = Array.from({ length: TRACK_MARKER_COUNT }, () => ({
       world: new THREE.Vector3(),
       point: new THREE.Vector3(),
       x: 0,
       y: 0,
       visible: false,
     }));
-    const connectionFlags = new Uint8Array(24 * 24);
+    const connectionFlags = new Uint8Array(
+      TRACK_MARKER_COUNT * TRACK_MARKER_COUNT,
+    );
     const labelCandidates = [
       { x: 10, y: -9, anchor: "start" },
       { x: -10, y: -9, anchor: "end" },
@@ -373,8 +459,13 @@ export default function App() {
             cloud.rotation.x =
               Math.cos(t * 0.16) * 0.07 - pointerRef.current.y * 0.12;
         }
-        if (hudRef.current)
+        if (hudRef.current) {
           hudRef.current.style.display = settings.hudOn ? "" : "none";
+          hudRef.current.setAttribute(
+            "viewBox",
+            `0 0 ${host.clientWidth} ${host.clientHeight}`,
+          );
+        }
         if (settings.hudOn && data.trackIndices.length) {
           cloud.updateMatrixWorld(true);
           movingCloud.updateMatrixWorld(true);
@@ -415,7 +506,7 @@ export default function App() {
             }
             const label = trackLabelRefs.current[n];
             if (label && tracked.visible) {
-              const text = `${String(n + 1).padStart(2, "0")}  ${tracked.point.x.toFixed(2)} ${tracked.point.y.toFixed(2)} ${tracked.point.z.toFixed(2)}`;
+              const text = `${String(n + 1).padStart(2, "0")}  ${tracked.world.x.toFixed(2)} ${tracked.world.y.toFixed(2)} ${tracked.world.z.toFixed(2)}`;
               const width = text.length * 4.2;
               let chosen = labelCandidates[0];
               let bestOverlap = Infinity;
@@ -471,15 +562,16 @@ export default function App() {
           if (connectionRef.current) {
             connectionFlags.fill(0);
             for (let i = 0; i < count; i++) {
+              if (!projectedTracks[i].visible) continue;
               const nearest = [-1, -1];
               const distances = [Infinity, Infinity];
               const from = projectedTracks[i].world;
               for (let j = 0; j < count; j++) {
-                if (i === j) continue;
+                if (i === j || !projectedTracks[j].visible) continue;
                 const distance = from.distanceToSquared(
                   projectedTracks[j].world,
                 );
-                if (distance > cloud.scale.x * cloud.scale.x * 0.06) continue;
+                if (distance > cloud.scale.x * cloud.scale.x * 0.12) continue;
                 if (distance < distances[0]) {
                   distances[1] = distances[0];
                   nearest[1] = nearest[0];
@@ -529,10 +621,7 @@ export default function App() {
           initialCameraDistance;
         const data = pointsDataRef.current;
         cloudRef.current.scale.setScalar(
-          Math.min(
-            viewHeight * 0.7,
-            (viewHeight * camera.aspect * 0.7) / data.aspect,
-          ),
+          getFitScale(viewHeight, camera.aspect, data.aspect),
         );
         movingCloudRef.current?.scale.copy(cloudRef.current.scale);
       }
@@ -638,7 +727,7 @@ export default function App() {
           <div className="viewport" ref={mountRef}>
             <svg className="hud-layer" ref={hudRef} aria-hidden="true">
               <path className="track-network" ref={connectionRef} />
-              {Array.from({ length: 24 }, (_, i) => (
+              {Array.from({ length: TRACK_MARKER_COUNT }, (_, i) => (
                 <g
                   className="track"
                   key={i}
