@@ -20,21 +20,27 @@ function makeParticles(image, density, depth) {
   const rows = Math.max(1, Math.ceil(density / columns));
   const positions = new Float32Array(density * 3);
   const colors = new Float32Array(density * 4);
-  const originals = new Float32Array(density * 3);
-  const phases = new Float32Array(density);
   let count = 0;
   const linearize = (value) =>
     value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
   for (let sample = 0; sample < density; sample++) {
     const column = sample % columns,
       row = Math.floor(sample / columns);
+    const sampleX = Math.min(
+      canvas.width - 1,
+      (column + 0.15 + Math.random() * 0.7) * (canvas.width / columns),
+    );
+    const sampleY = Math.min(
+      canvas.height - 1,
+      (row + 0.15 + Math.random() * 0.7) * (canvas.height / rows),
+    );
     const x = Math.min(
       canvas.width - 1,
-      Math.floor(((column + 0.5) * canvas.width) / columns),
+      Math.floor(sampleX),
     );
     const y = Math.min(
       canvas.height - 1,
-      Math.floor(((row + 0.5) * canvas.height) / rows),
+      Math.floor(sampleY),
     );
     const i = (y * canvas.width + x) * 4;
     const r = pixels[i],
@@ -43,30 +49,53 @@ function makeParticles(image, density, depth) {
       a = pixels[i + 3] / 255;
     const lum = (r * 0.2126 + g * 0.7152 + b * 0.0722) / 255;
     if (a < 0.08) continue;
-    const px = ((column + 0.5) / columns - 0.5) * aspect;
-    const py = -((row + 0.5) / rows - 0.5);
+    const px = (sampleX / canvas.width - 0.5) * aspect;
+    const py = -(sampleY / canvas.height - 0.5);
     const pz = (lum - 0.5) * depth * 0.18;
     const i3 = count * 3,
       i4 = count * 4;
     positions[i3] = px;
     positions[i3 + 1] = py;
     positions[i3 + 2] = pz;
-    originals[i3] = px;
-    originals[i3 + 1] = py;
-    originals[i3 + 2] = pz;
     colors[i4] = linearize(r / 255);
     colors[i4 + 1] = linearize(g / 255);
     colors[i4 + 2] = linearize(b / 255);
     colors[i4 + 3] = a;
-    phases[count] = Math.random() * Math.PI * 2;
     count++;
   }
-  const trackCount = Math.min(24, count);
-  const trackIndices = new Uint32Array(trackCount);
+  const movingCount = Math.min(count, Math.max(1, Math.floor(count * 0.03)));
+  const movingPositions = new Float32Array(movingCount * 3);
+  const movingColors = new Float32Array(movingCount * 4);
+  const movingPhases = new Float32Array(movingCount);
+  const movingSpeeds = new Float32Array(movingCount);
+  const movingAmplitudes = new Float32Array(movingCount * 3);
   const shuffledIndices = new Uint32Array(count);
   for (let i = 0; i < count; i++) shuffledIndices[i] = i;
-  for (let i = 0; i < trackCount; i++) {
+  for (let i = 0; i < movingCount; i++) {
     const selected = i + Math.floor(Math.random() * (count - i));
+    [shuffledIndices[i], shuffledIndices[selected]] = [
+      shuffledIndices[selected],
+      shuffledIndices[i],
+    ];
+    const sourceIndex = shuffledIndices[i];
+    movingPositions.set(
+      positions.subarray(sourceIndex * 3, sourceIndex * 3 + 3),
+      i * 3,
+    );
+    movingColors.set(
+      colors.subarray(sourceIndex * 4, sourceIndex * 4 + 4),
+      i * 4,
+    );
+    movingPhases[i] = Math.random() * Math.PI * 2;
+    movingSpeeds[i] = 0.45 + Math.random() * 1.1;
+    movingAmplitudes[i * 3] = 0.018 + Math.random() * 0.042;
+    movingAmplitudes[i * 3 + 1] = 0.018 + Math.random() * 0.042;
+    movingAmplitudes[i * 3 + 2] = 0.025 + Math.random() * 0.055;
+  }
+  const trackCount = Math.min(24, movingCount);
+  const trackIndices = new Uint32Array(trackCount);
+  for (let i = 0; i < trackCount; i++) {
+    const selected = i + Math.floor(Math.random() * (movingCount - i));
     [shuffledIndices[i], shuffledIndices[selected]] = [
       shuffledIndices[selected],
       shuffledIndices[i],
@@ -76,8 +105,11 @@ function makeParticles(image, density, depth) {
   return {
     positions: positions.subarray(0, count * 3),
     colors: colors.subarray(0, count * 4),
-    originals: originals.subarray(0, count * 3),
-    phases: phases.subarray(0, count),
+    movingPositions,
+    movingColors,
+    movingPhases,
+    movingSpeeds,
+    movingAmplitudes,
     trackIndices,
     aspect,
   };
@@ -87,6 +119,7 @@ export default function App() {
   const mountRef = useRef(null);
   const sceneRef = useRef(null);
   const cloudRef = useRef(null);
+  const movingCloudRef = useRef(null);
   const pointsDataRef = useRef(null);
   const rebuildIdRef = useRef(0);
   const pointerRef = useRef({ x: 0, y: 0 });
@@ -114,6 +147,8 @@ export default function App() {
   useEffect(() => {
     particleSizeRef.current = particleSize;
     if (cloudRef.current) cloudRef.current.material.size = particleSize;
+    if (movingCloudRef.current)
+      movingCloudRef.current.material.size = particleSize;
   }, [particleSize]);
 
   const rebuild = useCallback(
@@ -154,14 +189,42 @@ export default function App() {
         });
         const next = new THREE.Points(geometry, material);
         next.frustumCulled = false;
+        const movingGeometry = new THREE.BufferGeometry();
+        movingGeometry.setAttribute(
+          "position",
+          new THREE.BufferAttribute(data.movingPositions.slice(), 3),
+        );
+        movingGeometry.setAttribute(
+          "color",
+          new THREE.BufferAttribute(data.movingColors, 4),
+        );
+        const movingMaterial = new THREE.PointsMaterial({
+          size: particleSizeRef.current,
+          vertexColors: true,
+          transparent: true,
+          opacity: 0.72,
+          sizeAttenuation: false,
+          depthWrite: false,
+          blending: THREE.AdditiveBlending,
+        });
+        const moving = new THREE.Points(movingGeometry, movingMaterial);
+        moving.frustumCulled = false;
         if (cloudRef.current) {
           scene.remove(cloudRef.current);
           cloudRef.current.geometry.dispose();
           cloudRef.current.material.dispose();
         }
+        if (movingCloudRef.current) {
+          scene.remove(movingCloudRef.current);
+          movingCloudRef.current.geometry.dispose();
+          movingCloudRef.current.material.dispose();
+        }
         next.scale.setScalar(fitScale);
+        moving.scale.setScalar(fitScale);
         scene.add(next);
+        scene.add(moving);
         cloudRef.current = next;
+        movingCloudRef.current = moving;
         pointsDataRef.current = data;
         setPointCount(data.positions.length / 3);
       };
@@ -277,33 +340,44 @@ export default function App() {
         );
       }
       const cloud = cloudRef.current,
+        movingCloud = movingCloudRef.current,
         data = pointsDataRef.current;
-      if (cloud && data) {
-        const attr = cloud.geometry.attributes.position;
+      if (cloud && movingCloud && data) {
+        const movingAttr = movingCloud.geometry.attributes.position;
         if (!settings.isPaused) {
-          for (let i = 0; i < data.originals.length; i += 3) {
-            const p = i / 3,
-              phase = data.phases[p];
-            const ox = data.originals[i],
-              oy = data.originals[i + 1],
-              oz = data.originals[i + 2];
+          for (let i = 0; i < data.movingPositions.length; i += 3) {
+            const p = i / 3;
+            const phase = data.movingPhases[p];
+            const speed = data.movingSpeeds[p];
+            const ox = data.movingPositions[i];
+            const oy = data.movingPositions[i + 1];
+            const oz = data.movingPositions[i + 2];
             const drift = settings.motion;
-            attr.array[i] =
-              ox + Math.sin(t * 0.7 + phase + oy * 2) * 0.018 * drift;
-            attr.array[i + 1] =
-              oy + Math.cos(t * 0.55 + phase + ox * 1.5) * 0.02 * drift;
-            attr.array[i + 2] = oz + Math.sin(t * 0.9 + phase) * 0.08 * drift;
+            const ax = data.movingAmplitudes[i] * drift;
+            const ay = data.movingAmplitudes[i + 1] * drift;
+            const az = data.movingAmplitudes[i + 2] * drift;
+            movingAttr.array[i] =
+              ox + Math.sin(t * speed + phase) * ax +
+              Math.sin(t * speed * 0.37 + phase * 1.7) * ax * 0.18;
+            movingAttr.array[i + 1] =
+              oy + Math.cos(t * speed * 0.83 + phase) * ay +
+              Math.sin(t * speed * 0.29 + phase * 1.3) * ay * 0.18;
+            movingAttr.array[i + 2] =
+              oz + Math.sin(t * speed * 0.67 + phase * 1.2) * az;
           }
-          attr.needsUpdate = true;
-          cloud.rotation.y =
-            Math.sin(t * 0.18) * 0.12 + pointerRef.current.x * 0.18;
-          cloud.rotation.x =
-            Math.cos(t * 0.16) * 0.07 - pointerRef.current.y * 0.12;
+          movingAttr.needsUpdate = true;
+          movingCloud.rotation.y =
+            cloud.rotation.y =
+              Math.sin(t * 0.18) * 0.12 + pointerRef.current.x * 0.18;
+          movingCloud.rotation.x =
+            cloud.rotation.x =
+              Math.cos(t * 0.16) * 0.07 - pointerRef.current.y * 0.12;
         }
         if (hudRef.current)
           hudRef.current.style.display = settings.hudOn ? "" : "none";
         if (settings.hudOn && data.trackIndices.length) {
           cloud.updateMatrixWorld(true);
+          movingCloud.updateMatrixWorld(true);
           camera.updateMatrixWorld();
           const w = host.clientWidth,
             h = host.clientHeight;
@@ -314,8 +388,12 @@ export default function App() {
             const i = idx * 3;
             const tracked = projectedTracks[n];
             tracked.world
-              .set(attr.array[i], attr.array[i + 1], attr.array[i + 2])
-              .applyMatrix4(cloud.matrixWorld);
+              .set(
+                movingAttr.array[i],
+                movingAttr.array[i + 1],
+                movingAttr.array[i + 2],
+              )
+              .applyMatrix4(movingCloud.matrixWorld);
             tracked.point.copy(tracked.world).project(camera);
             tracked.x = (tracked.point.x * 0.5 + 0.5) * w;
             tracked.y = (-tracked.point.y * 0.5 + 0.5) * h;
@@ -401,6 +479,7 @@ export default function App() {
                 const distance = from.distanceToSquared(
                   projectedTracks[j].world,
                 );
+                if (distance > cloud.scale.x * cloud.scale.x * 0.06) continue;
                 if (distance < distances[0]) {
                   distances[1] = distances[0];
                   nearest[1] = nearest[0];
@@ -455,6 +534,7 @@ export default function App() {
             (viewHeight * camera.aspect * 0.7) / data.aspect,
           ),
         );
+        movingCloudRef.current?.scale.copy(cloudRef.current.scale);
       }
     };
     const move = (e) => {
@@ -477,6 +557,12 @@ export default function App() {
         cloudRef.current.material.dispose();
         cloudRef.current = null;
         pointsDataRef.current = null;
+      }
+      if (movingCloudRef.current) {
+        scene.remove(movingCloudRef.current);
+        movingCloudRef.current.geometry.dispose();
+        movingCloudRef.current.material.dispose();
+        movingCloudRef.current = null;
       }
       renderer.dispose();
       if (renderer.domElement.parentNode === host)
