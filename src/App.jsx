@@ -2,6 +2,235 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 
+// ---------------------------------------------------------------------------
+// Standalone embed HTML generator
+// ---------------------------------------------------------------------------
+function generateEmbedHTML({ imageSrc, density, particleSize, depth, motion, includeTracking }) {
+  // Escape backtick/backslash in base64 data URL so it can live inside a template literal
+  const safeImage = imageSrc.replace(/\\/g, "\\\\").replace(/`/g, "\\`");
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Particle Field Embed</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{width:100%;height:100%;background:#050606;overflow:hidden}
+  canvas{display:block;width:100%!important;height:100%!important}
+  ${includeTracking ? `
+  #hud{position:fixed;inset:0;pointer-events:none;overflow:hidden;z-index:10}
+  .trk-net{fill:none;stroke:rgba(151,205,194,.28);stroke-width:.7;vector-effect:non-scaling-stroke}
+  .trk-brk{fill:none;stroke:rgba(195,231,223,.78);stroke-width:.8;vector-effect:non-scaling-stroke}
+  .trk-lbl{fill:rgba(211,229,224,.62);font:7px monospace;letter-spacing:.04em}
+  ` : ''}
+</style>
+</head>
+<body>
+${includeTracking ? `<svg id="hud" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true"><path class="trk-net" id="tc-net"/>${Array.from({length:12},(_,i)=>`<g class="trk-g" id="tk${i}" style="display:none"><path class="trk-brk" d="M-8 -3V-8H-3 M3 -8H8V-3 M8 3V8H3 M-3 8H-8V3"/><text class="trk-lbl" id="tl${i}" x="11" y="-8"></text></g>`).join('')}</svg>` : ''}
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.168.0/build/three.module.js","three/examples/jsm/controls/OrbitControls.js":"https://cdn.jsdelivr.net/npm/three@0.168.0/examples/jsm/controls/OrbitControls.js"}}
+<\/script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+
+const IMAGE_SRC = \`${safeImage}\`;
+const DENSITY = ${density};
+const PARTICLE_SIZE = ${particleSize};
+const DEPTH = ${depth};
+const MOTION = ${motion};
+const MIN_PARTICLE_COUNT = 25000;
+const MAX_PARTICLE_COUNT = 150000;
+const MAX_SAMPLE_DIMENSION = 1024;
+const IMAGE_FIT_FRACTION = 0.75;
+const MAX_VISUAL_SCALE = 2;
+const TRACK_MARKER_COUNT = 12;
+const SHOW_HUD = ${includeTracking ? 'true' : 'false'};
+
+function makeParticles(image, density, depth) {
+  const detailCanvas = document.createElement('canvas');
+  detailCanvas.width = 64; detailCanvas.height = 64;
+  const dctx = detailCanvas.getContext('2d',{willReadFrequently:true});
+  dctx.drawImage(image,0,0,64,64);
+  const dp = dctx.getImageData(0,0,64,64).data;
+  let edgePixels=0,opaquePixels=0;
+  for(let y=0;y<64;y++)for(let x=0;x<64;x++){const i=(y*64+x)*4;if(dp[i+3]<20)continue;opaquePixels++;const lum=(dp[i]*0.2126+dp[i+1]*0.7152+dp[i+2]*0.0722)/255;let diff=0;const right=x<63?i+4:-1,below=y<63?i+256:-1;for(const nb of[right,below]){if(nb<0)continue;const nl=(dp[nb]*0.2126+dp[nb+1]*0.7152+dp[nb+2]*0.0722)/255;diff=Math.max(diff,Math.abs(lum-nl),Math.abs(dp[i]-dp[nb])/255,Math.abs(dp[i+1]-dp[nb+1])/255,Math.abs(dp[i+2]-dp[nb+2])/255,Math.abs(dp[i+3]-dp[nb+3])/255);}if(diff>0.06)edgePixels++;}
+  const detailScore=opaquePixels>0?Math.min(1,(edgePixels/opaquePixels)*4):0;
+  const resFactor=THREE.MathUtils.clamp(Math.sqrt((image.naturalWidth*image.naturalHeight)/(512*512)),0.5,1.5);
+  const adaptiveCount=Math.floor(density*resFactor*(0.75+detailScore*0.75));
+  const particleCount=THREE.MathUtils.clamp(adaptiveCount,Math.min(MIN_PARTICLE_COUNT,density),Math.min(MAX_PARTICLE_COUNT,density));
+  const canvas=document.createElement('canvas');
+  const aspect=image.naturalWidth/image.naturalHeight;
+  const sd=Math.min(MAX_SAMPLE_DIMENSION,Math.max(512,Math.ceil(Math.sqrt(particleCount*8))));
+  const is=sd/Math.max(image.naturalWidth,image.naturalHeight);
+  canvas.width=Math.max(1,Math.round(image.naturalWidth*is));
+  canvas.height=Math.max(1,Math.round(image.naturalHeight*is));
+  const ctx=canvas.getContext('2d',{willReadFrequently:true});
+  ctx.drawImage(image,0,0,canvas.width,canvas.height);
+  const pixels=ctx.getImageData(0,0,canvas.width,canvas.height).data;
+  const columns=Math.max(1,Math.floor(Math.sqrt(particleCount*aspect)));
+  const rows=Math.max(1,Math.ceil(particleCount/columns));
+  const positions=new Float32Array(particleCount*3);
+  const colors=new Float32Array(particleCount*4);
+  let count=0;
+  const lin=v=>v<=0.04045?v/12.92:((v+0.055)/1.055)**2.4;
+  for(let s=0;s<particleCount;s++){const col=s%columns,row=Math.floor(s/columns);const sx=Math.min(canvas.width-1,(col+0.15+Math.random()*0.7)*(canvas.width/columns));const sy=Math.min(canvas.height-1,(row+0.15+Math.random()*0.7)*(canvas.height/rows));const x=Math.min(canvas.width-1,Math.floor(sx));const y=Math.min(canvas.height-1,Math.floor(sy));const i=(y*canvas.width+x)*4;const r=pixels[i],g=pixels[i+1],b=pixels[i+2],a=pixels[i+3]/255;const lum=(r*0.2126+g*0.7152+b*0.0722)/255;if(a<0.08)continue;const px=(sx/canvas.width-0.5)*aspect;const py=-(sy/canvas.height-0.5);const pz=(lum-0.5)*depth*0.18;const i3=count*3,i4=count*4;positions[i3]=px;positions[i3+1]=py;positions[i3+2]=pz;colors[i4]=lin(r/255);colors[i4+1]=lin(g/255);colors[i4+2]=lin(b/255);colors[i4+3]=a;count++;}
+  const mc=Math.min(count,Math.max(1,Math.floor(count*0.03)));
+  const mp=new Float32Array(mc*3),mcols=new Float32Array(mc*4),mph=new Float32Array(mc),msp=new Float32Array(mc),mam=new Float32Array(mc*3);
+  const si=new Uint32Array(count);for(let i=0;i<count;i++)si[i]=i;
+  for(let i=0;i<mc;i++){const sel=i+Math.floor(Math.random()*(count-i));[si[i],si[sel]]=[si[sel],si[i]];const src=si[i];mp.set(positions.subarray(src*3,src*3+3),i*3);mcols.set(colors.subarray(src*4,src*4+4),i*4);mph[i]=Math.random()*Math.PI*2;msp[i]=0.45+Math.random()*1.1;mam[i*3]=0.018+Math.random()*0.042;mam[i*3+1]=0.018+Math.random()*0.042;mam[i*3+2]=0.025+Math.random()*0.055;}
+  const tc=[];for(let i=0;i<mc;i++){const ci=i*4;const lum=mcols[ci]*0.2126+mcols[ci+1]*0.7152+mcols[ci+2]*0.0722;if(lum>0.012)tc.push(i);}
+  const tcount=Math.min(TRACK_MARKER_COUNT,tc.length);const ti=new Uint32Array(tcount);
+  for(let i=0;i<tc.length;i++){const sel=i+Math.floor(Math.random()*(tc.length-i));[tc[i],tc[sel]]=[tc[sel],tc[i]];}
+  for(let i=0;i<tcount;i++)ti[i]=tc[i];
+  return{positions:positions.subarray(0,count*3),colors:colors.subarray(0,count*4),movingPositions:mp,movingColors:mcols,movingPhases:mph,movingSpeeds:msp,movingAmplitudes:mam,trackIndices:ti,aspect};
+}
+
+function getFitScale(vh,va,ia){return Math.min(vh*IMAGE_FIT_FRACTION,(vh*va*IMAGE_FIT_FRACTION)/ia,vh*MAX_VISUAL_SCALE);}
+
+const host=document.body;
+const scene=new THREE.Scene();
+scene.background=new THREE.Color('#050606');
+const camera=new THREE.PerspectiveCamera(43,host.clientWidth/host.clientHeight,0.1,100);
+camera.position.set(0,0,8.8);
+const renderer=new THREE.WebGLRenderer({antialias:true,alpha:false,powerPreference:'high-performance'});
+renderer.setPixelRatio(Math.min(window.devicePixelRatio||1,1.7));
+renderer.setSize(host.clientWidth,host.clientHeight);
+renderer.outputColorSpace=THREE.SRGBColorSpace;
+host.appendChild(renderer.domElement);
+const controls=new OrbitControls(camera,renderer.domElement);
+controls.enableDamping=true;
+controls.dampingFactor=0.08;
+const icd=camera.position.distanceTo(controls.target);
+controls.minDistance=icd/15;
+controls.maxDistance=icd*2;
+let cloud=null,movingCloud=null,data=null;
+const pointer={x:0,y:0};
+
+const image=new Image();
+image.crossOrigin='anonymous';
+image.onload=()=>{
+  const bvh=2*Math.tan(THREE.MathUtils.degToRad(camera.fov/2))*icd;
+  const fitScale=getFitScale(bvh,camera.aspect,image.naturalWidth/image.naturalHeight);
+  data=makeParticles(image,DENSITY,DEPTH);
+  const geo=new THREE.BufferGeometry();
+  geo.setAttribute('position',new THREE.BufferAttribute(data.positions,3));
+  geo.setAttribute('color',new THREE.BufferAttribute(data.colors,4));
+  const mat=new THREE.PointsMaterial({size:PARTICLE_SIZE,vertexColors:true,transparent:true,opacity:1,sizeAttenuation:false,depthWrite:false});
+  cloud=new THREE.Points(geo,mat);
+  cloud.frustumCulled=false;
+  const mgeo=new THREE.BufferGeometry();
+  mgeo.setAttribute('position',new THREE.BufferAttribute(data.movingPositions.slice(),3));
+  mgeo.setAttribute('color',new THREE.BufferAttribute(data.movingColors,4));
+  const mmat=new THREE.PointsMaterial({size:PARTICLE_SIZE,vertexColors:true,transparent:true,opacity:0.72,sizeAttenuation:false,depthWrite:false,blending:THREE.AdditiveBlending});
+  movingCloud=new THREE.Points(mgeo,mmat);
+  movingCloud.frustumCulled=false;
+  cloud.scale.setScalar(fitScale);
+  movingCloud.scale.setScalar(fitScale);
+  scene.add(cloud);
+  scene.add(movingCloud);
+};
+image.src=IMAGE_SRC;
+
+// HUD tracking setup
+const hudSvg=SHOW_HUD?document.getElementById('hud'):null;
+const hudNet=SHOW_HUD?document.getElementById('tc-net'):null;
+const hudMarkers=SHOW_HUD?Array.from({length:TRACK_MARKER_COUNT},(_,i)=>document.getElementById('tk'+i)):[];
+const hudLabels=SHOW_HUD?Array.from({length:TRACK_MARKER_COUNT},(_,i)=>document.getElementById('tl'+i)):[];
+const labelCandidates=[{x:10,y:-9,a:'start'},{x:-10,y:-9,a:'end'},{x:10,y:11,a:'start'},{x:-10,y:11,a:'end'},{x:10,y:-18,a:'start'},{x:-10,y:-18,a:'end'},{x:10,y:20,a:'start'},{x:-10,y:20,a:'end'}];
+const projTracks=Array.from({length:TRACK_MARKER_COUNT},()=>({world:new THREE.Vector3(),point:new THREE.Vector3(),x:0,y:0,visible:false}));
+const connFlags=new Uint8Array(TRACK_MARKER_COUNT*TRACK_MARKER_COUNT);
+
+function resizeHud(){if(hudSvg){hudSvg.setAttribute('viewBox','0 0 '+window.innerWidth+' '+window.innerHeight);}}
+resizeHud();
+
+const clock=new THREE.Clock();
+function animate(){
+  requestAnimationFrame(animate);
+  const t=clock.getElapsedTime();
+  controls.update();
+  if(cloud&&movingCloud&&data){
+    const ma=movingCloud.geometry.attributes.position;
+    for(let i=0;i<data.movingPositions.length;i+=3){
+      const p=i/3;const ph=data.movingPhases[p];const sp=data.movingSpeeds[p];
+      const ox=data.movingPositions[i],oy=data.movingPositions[i+1],oz=data.movingPositions[i+2];
+      const ax=data.movingAmplitudes[i]*MOTION,ay=data.movingAmplitudes[i+1]*MOTION,az=data.movingAmplitudes[i+2]*MOTION;
+      ma.array[i]=ox+Math.sin(t*sp+ph)*ax+Math.sin(t*sp*0.37+ph*1.7)*ax*0.18;
+      ma.array[i+1]=oy+Math.cos(t*sp*0.83+ph)*ay+Math.sin(t*sp*0.29+ph*1.3)*ay*0.18;
+      ma.array[i+2]=oz+Math.sin(t*sp*0.67+ph*1.2)*az;
+    }
+    ma.needsUpdate=true;
+    movingCloud.rotation.y=cloud.rotation.y=Math.sin(t*0.18)*0.12+pointer.x*0.18;
+    movingCloud.rotation.x=cloud.rotation.x=Math.cos(t*0.16)*0.07-pointer.y*0.12;
+    // HUD projection
+    if(SHOW_HUD&&data.trackIndices.length){
+      cloud.updateMatrixWorld(true);movingCloud.updateMatrixWorld(true);camera.updateMatrixWorld();
+      const W=window.innerWidth,H=window.innerHeight;
+      const cnt=data.trackIndices.length;
+      const placed=[];
+      for(let n=0;n<cnt;n++){
+        const idx=data.trackIndices[n];const i3=idx*3;
+        const tr=projTracks[n];
+        tr.world.set(ma.array[i3],ma.array[i3+1],ma.array[i3+2]).applyMatrix4(movingCloud.matrixWorld);
+        tr.point.copy(tr.world).project(camera);
+        tr.x=(tr.point.x*0.5+0.5)*W;
+        tr.y=(-tr.point.y*0.5+0.5)*H;
+        tr.visible=tr.point.z>=-1&&tr.point.z<=1&&tr.x>=0&&tr.x<=W&&tr.y>=0&&tr.y<=H;
+        const mk=hudMarkers[n];
+        if(mk){mk.style.display=tr.visible?'':'none';if(tr.visible)mk.setAttribute('transform','translate('+tr.x.toFixed(1)+' '+tr.y.toFixed(1)+')');}        
+        const lb=hudLabels[n];
+        if(lb&&tr.visible){
+          const txt=(n+1).toString().padStart(2,'0')+'  '+tr.world.x.toFixed(2)+' '+tr.world.y.toFixed(2)+' '+tr.world.z.toFixed(2);
+          const tw=txt.length*4.2;
+          let chosen=labelCandidates[0];let best=Infinity;
+          for(const c of labelCandidates){const lx=c.a==='start'?tr.x+c.x:tr.x+c.x-tw;const ty=tr.y+c.y-8;const rx=lx+tw,by=ty+10;let ov=0;for(const p of placed){ov+=Math.max(0,Math.min(rx,p.r)-Math.max(lx,p.l))*Math.max(0,Math.min(by,p.b)-Math.max(ty,p.t));}ov+=Math.max(0,2-lx)*tw+Math.max(0,rx-(W-2))*tw+Math.max(0,2-ty)*tw+Math.max(0,by-(H-2))*tw;if(ov<best){best=ov;chosen=c;}if(ov===0)break;}
+          const fl=chosen.a==='start'?tr.x+chosen.x:tr.x+chosen.x-tw;
+          placed.push({l:fl,r:fl+tw,t:tr.y+chosen.y-8,b:tr.y+chosen.y+2});
+          lb.textContent=txt;
+          lb.setAttribute('x',String(chosen.x));
+          lb.setAttribute('y',String(chosen.y));
+          lb.setAttribute('text-anchor',chosen.a);
+        }
+      }
+      // connections
+      if(hudNet){
+        connFlags.fill(0);
+        for(let i=0;i<cnt;i++){
+          if(!projTracks[i].visible)continue;
+          const near=[-1,-1];const dist=[Infinity,Infinity];
+          const fw=projTracks[i].world;
+          for(let j=0;j<cnt;j++){if(i===j||!projTracks[j].visible)continue;const d=fw.distanceToSquared(projTracks[j].world);if(d>cloud.scale.x*cloud.scale.x*0.12)continue;if(d<dist[0]){dist[1]=dist[0];near[1]=near[0];dist[0]=d;near[0]=j;}else if(d<dist[1]){dist[1]=d;near[1]=j;}}
+          for(const nb of near){if(nb>=0){connFlags[i*cnt+nb]=1;connFlags[nb*cnt+i]=1;}}
+        }
+        const paths=[];
+        for(let i=0;i<cnt;i++)for(let j=i+1;j<cnt;j++){if(!connFlags[i*cnt+j])continue;const a=projTracks[i],b=projTracks[j];if(a.visible&&b.visible)paths.push('M'+a.x.toFixed(1)+','+a.y.toFixed(1)+'L'+b.x.toFixed(1)+','+b.y.toFixed(1));}
+        hudNet.setAttribute('d',paths.join(''));
+      }
+    } else if(hudNet){
+      hudNet.setAttribute('d','');
+    }
+  }
+  renderer.render(scene,camera);
+}
+animate();
+
+window.addEventListener('resize',()=>{
+  camera.aspect=host.clientWidth/host.clientHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(host.clientWidth,host.clientHeight);
+  resizeHud();
+  if(cloud&&data){const vh=2*Math.tan(THREE.MathUtils.degToRad(camera.fov/2))*icd;cloud.scale.setScalar(getFitScale(vh,camera.aspect,data.aspect));movingCloud&&movingCloud.scale.copy(cloud.scale);}
+});
+window.addEventListener('pointermove',e=>{
+  pointer.x=((e.clientX/window.innerWidth)-0.5)*2;
+  pointer.y=((e.clientY/window.innerHeight)-0.5)*2;
+});
+<\/script>
+</body>
+</html>`;
+}
+
 const DEFAULT_IMAGE = `data:image/svg+xml,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" width="360" height="360" viewBox="0 0 360 360"><rect width="360" height="360" fill="#050606"/><defs><radialGradient id="g"><stop stop-color="#ffffff"/><stop offset=".56" stop-color="#d8e2e3"/><stop offset="1" stop-color="#263334"/></radialGradient></defs><circle cx="180" cy="180" r="112" fill="url(#g)"/><circle cx="144" cy="148" r="10" fill="#101414"/><circle cx="216" cy="148" r="10" fill="#101414"/><path d="M135 205 Q180 255 225 205" fill="none" stroke="#101414" stroke-width="8" stroke-linecap="round"/></svg>`)}`;
 const TRACK_MARKER_COUNT = 12;
 const MIN_PARTICLE_COUNT = 25000;
@@ -224,6 +453,10 @@ export default function App() {
   const [hudOn, setHudOn] = useState(true);
   const [pointCount, setPointCount] = useState(0);
   const [imageSrc, setImageSrc] = useState(DEFAULT_IMAGE);
+  const [exportModal, setExportModal] = useState(false);
+  const [embedCode, setEmbedCode] = useState("");
+  const [copyLabel, setCopyLabel] = useState("COPY CODE");
+  const [includeTracking, setIncludeTracking] = useState(false);
   const settingsRef = useRef({ density, depth, motion, isPaused, hudOn });
   useEffect(() => {
     settingsRef.current = { density, depth, motion, isPaused, hudOn };
@@ -694,6 +927,50 @@ export default function App() {
     sceneRef.current?.controls.reset();
   };
 
+  const openExportModal = () => {
+    const html = generateEmbedHTML({ imageSrc, density, particleSize, depth, motion, includeTracking });
+    setEmbedCode(html);
+    setExportModal(true);
+    setCopyLabel("COPY CODE");
+  };
+
+  // Regenerate embed code live when tracking toggle changes inside modal
+  const toggleTracking = () => {
+    const next = !includeTracking;
+    setIncludeTracking(next);
+    if (exportModal) {
+      const html = generateEmbedHTML({ imageSrc, density, particleSize, depth, motion, includeTracking: next });
+      setEmbedCode(html);
+      setCopyLabel("COPY CODE");
+    }
+  };
+
+  const copyEmbed = async () => {
+    try {
+      await navigator.clipboard.writeText(embedCode);
+      setCopyLabel("✓ COPIED!");
+      setTimeout(() => setCopyLabel("COPY CODE"), 2200);
+    } catch {
+      setCopyLabel("COPY FAILED");
+    }
+  };
+
+  const downloadEmbed = () => {
+    const blob = new Blob([embedCode], { type: "text/html" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `particle-field-${Date.now()}.html`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const previewEmbed = () => {
+    const blob = new Blob([embedCode], { type: "text/html" });
+    const url = URL.createObjectURL(blob);
+    window.open(url, "_blank");
+  };
+
   return (
     <main className="app-shell">
       <header className="topbar">
@@ -812,6 +1089,17 @@ export default function App() {
             <span>DRAG TO ORBIT · SCROLL TO ZOOM</span>
             <span>LOCAL RENDER / NO API</span>
           </div>
+        </div>
+        {/* Export bar */}
+        <div className="export-bar">
+          <div className="export-bar-left">
+            <span className="export-bar-label">EMBED THIS ANIMATION</span>
+            <span className="export-bar-desc">Generate a self-contained HTML snippet — drop it on any website</span>
+          </div>
+          <button className="export-btn" onClick={openExportModal} id="export-embed-btn">
+            <span className="export-btn-icon">⬡</span>
+            Export embed
+          </button>
         </div>
         <div className="lower-grid">
           <section className="panel source-panel">
@@ -969,6 +1257,82 @@ export default function App() {
           <span>BUILT WITH THREE.JS</span>
         </footer>
       </section>
+
+      {/* ── Export Modal ── */}
+      {exportModal && (
+        <div className="embed-overlay" onClick={(e) => { if (e.target === e.currentTarget) setExportModal(false); }}>
+          <div className="embed-modal">
+            <div className="embed-modal-header">
+              <div>
+                <p className="embed-modal-eyebrow">04 / EXPORT</p>
+                <h2 className="embed-modal-title">Embed particle field</h2>
+              </div>
+              <button className="embed-close" onClick={() => setExportModal(false)} aria-label="Close">✕</button>
+            </div>
+
+            <p className="embed-modal-desc">
+              A fully self-contained HTML file — zero dependencies, no server needed.
+              Mouse movement, particle drift and depth are all baked in.
+            </p>
+
+            {/* Tracking annotation toggle */}
+            <div className="embed-option-row">
+              <div className="embed-option-left">
+                <span className="embed-option-label">Include tracking annotations</span>
+                <span className="embed-option-desc">Bracket markers, coordinate labels &amp; connection lines — live in the embed</span>
+              </div>
+              <button
+                className={`toggle embed-track-toggle ${includeTracking ? "on" : ""}`}
+                onClick={toggleTracking}
+                aria-label="Toggle tracking annotations in embed"
+                id="embed-track-toggle-btn"
+              >
+                <span />
+              </button>
+            </div>
+
+            <div className="embed-usage-steps">
+              <div className="embed-step">
+                <span className="embed-step-num">01</span>
+                <span>Copy the code or download the <code>.html</code> file</span>
+              </div>
+              <div className="embed-step">
+                <span className="embed-step-num">02</span>
+                <span>Paste an <code>&lt;iframe&gt;</code> tag pointing to the file, or inline the HTML</span>
+              </div>
+              <div className="embed-step">
+                <span className="embed-step-num">03</span>
+                <span>Works on any site — React, Vue, plain HTML, Webflow, Framer…</span>
+              </div>
+            </div>
+
+            <div className="embed-snippet-box">
+              <div className="embed-snippet-topbar">
+                <span className="embed-lang-tag">HTML</span>
+                <span className="embed-size-tag">{(new Blob([embedCode]).size / 1024).toFixed(1)} KB</span>
+              </div>
+              <pre className="embed-code-pre"><code>{embedCode.slice(0, 1800)}{embedCode.length > 1800 ? "\n\n… (truncated for preview — copy or download for full file)" : ""}</code></pre>
+            </div>
+
+            <div className="embed-iframe-hint">
+              <span className="embed-hint-label">IFRAME USAGE</span>
+              <code className="embed-iframe-code">{`<iframe src="particle-field.html" width="600" height="400" frameborder="0" allowfullscreen></iframe>`}</code>
+            </div>
+
+            <div className="embed-actions">
+              <button className="embed-action-btn primary" onClick={copyEmbed} id="copy-embed-btn">
+                {copyLabel}
+              </button>
+              <button className="embed-action-btn" onClick={downloadEmbed} id="download-embed-btn">
+                ↓ DOWNLOAD .HTML
+              </button>
+              <button className="embed-action-btn" onClick={previewEmbed} id="preview-embed-btn">
+                ↗ PREVIEW
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </main>
   );
 }
